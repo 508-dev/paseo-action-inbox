@@ -76,6 +76,7 @@ export function InboxRow({
       await onRefresh();
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
+      void onRefresh();
     } finally {
       setPending(null);
     }
