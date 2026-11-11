@@ -1,242 +1,246 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Pressable, ScrollView, Text, View } from "react-native";
-import {
-  getPaseoClient,
-  useHosts,
-  type PluginHostSummary,
-  type PluginScreenProps,
-} from "@getpaseo/plugin/client";
-import {
-  cardsForAgent,
-  directActions,
-  permissionDetails,
-  respondToCard,
-  sortCards,
-  type InboxCard,
-  type PermissionAction,
-} from "./inbox-model";
-
-interface InboxSnapshot {
-  cards: InboxCard[];
-  errors: string[];
-  truncatedHosts: string[];
-}
-
-async function loadHost(
-  host: PluginHostSummary,
-): Promise<{ cards: InboxCard[]; truncated: boolean }> {
-  const paseo = getPaseoClient(host.serverId);
-  const cards: InboxCard[] = [];
-  let cursor: string | undefined;
-  let pageCount = 0;
-  do {
-    const result = await paseo.agents.list({
-      scope: "active",
-      page: { limit: 200, ...(cursor ? { cursor } : {}) },
-    });
-    for (const entry of result.entries) {
-      cards.push(
-        ...cardsForAgent(entry.agent, {
-          hostId: host.serverId,
-          hostLabel: host.label,
-          projectName: entry.project.projectName,
-        }),
-      );
-    }
-    cursor = result.pageInfo.nextCursor ?? undefined;
-    pageCount += 1;
-  } while (cursor && pageCount < 5);
-  return { cards, truncated: Boolean(cursor) };
-}
+import { useState } from "react";
+import { ScrollView, Text, View } from "react-native";
+import { getPaseoClient, useSettings, type PluginScreenProps } from "@getpaseo/plugin/client";
+import { inboxPreferences } from "../shared/preferences";
+import { filterCards, isUnread, markRead, type InboxCard } from "./inbox-model";
+import { InboxButton, InboxFilter } from "./inbox-controls";
+import { InboxRow } from "./inbox-row";
+import { useInbox } from "./use-inbox";
 
 export function InboxScreen({ theme, layout, navigation }: PluginScreenProps) {
-  const hosts = useHosts();
-  const [snapshot, setSnapshot] = useState<InboxSnapshot>({
-    cards: [],
-    errors: [],
-    truncatedHosts: [],
-  });
-  const [loading, setLoading] = useState(true);
-  const [pendingKey, setPendingKey] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const refreshVersion = useRef(0);
+  const inbox = useInbox();
+  const preferences = useSettings(inboxPreferences);
+  const [hostId, setHostId] = useState<string | null>(null);
+  const [projectKey, setProjectKey] = useState<string | null>(null);
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const read = preferences.status === "ready" ? preferences.values.readTokens : {};
+  const readReady = preferences.status === "ready";
+  const unreadCount = inbox.cards.filter((card) => isUnread(card, read)).length;
+  const visible = filterCards(inbox.cards, { hostId, projectKey, unreadOnly }, read);
+  const scopedUnreadCount = filterCards(
+    inbox.cards,
+    { hostId, projectKey, unreadOnly: true },
+    read,
+  ).length;
+  const onlineCount = inbox.hosts.filter((host) => host.status === "online").length;
+  const projects = [
+    ...new Map(
+      inbox.cards
+        .filter((card) => !hostId || card.hostId === hostId)
+        .map((card) => [
+          card.projectKey,
+          { value: card.projectKey, label: card.projectName, description: card.hostLabel },
+        ]),
+    ).values(),
+  ].sort((a, b) => a.label.localeCompare(b.label));
+  const offline = inbox.hosts.filter((host) => host.status !== "online");
+  const filtered = hostId !== null || projectKey !== null || unreadOnly;
 
-  const refresh = useCallback(async () => {
-    const version = ++refreshVersion.current;
-    const online = hosts.filter((host) => host.status === "online");
-    const results = await Promise.allSettled(online.map((host) => loadHost(host)));
-    if (version !== refreshVersion.current) return;
-    const cards: InboxCard[] = [];
-    const errors: string[] = [];
-    const truncatedHosts: string[] = [];
-    results.forEach((result, index) => {
-      const host = online[index];
-      if (result.status === "rejected") {
-        errors.push(
-          `${host.label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
-        );
-      } else {
-        cards.push(...result.value.cards);
-        if (result.value.truncated) truncatedHosts.push(host.label);
-      }
-    });
-    setSnapshot({ cards: sortCards(cards), errors, truncatedHosts });
-    setLoading(false);
-  }, [hosts]);
+  async function setRead(cards: InboxCard[], value: boolean) {
+    if (preferences.status !== "ready" || preferences.saving) return;
+    const next = value
+      ? markRead(preferences.values.readTokens, cards)
+      : { ...preferences.values.readTokens };
+    if (!value) for (const card of cards) delete next[card.key];
+    await preferences.save({ readTokens: next }, preferences.revision);
+  }
 
-  useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => void refresh(), 20_000);
-    return () => {
-      clearInterval(timer);
-      refreshVersion.current += 1;
-    };
-  }, [refresh]);
-
-  const respond = useCallback(
-    async (card: InboxCard, action: PermissionAction) => {
-      if (!card.permission || pendingKey) return;
-      setPendingKey(card.key);
-      setActionError(null);
-      try {
-        await respondToCard(card, action, () =>
-          getPaseoClient(card.hostId).agents.ref(card.agentId),
-        );
-        await refresh();
-      } catch (error) {
-        setActionError(error instanceof Error ? error.message : String(error));
-      } finally {
-        setPendingKey(null);
-      }
-    },
-    [pendingKey, refresh],
-  );
-
-  const foreground = { color: theme.colors.foreground };
-  const muted = { color: theme.colors.foregroundMuted };
-  const buttonText = { color: theme.colors.accentForeground, fontWeight: "600" as const };
-  const offlineHosts = hosts.filter((host) => host.status !== "online");
+  const muted = { color: theme.colors.foregroundMuted, fontSize: 12 };
   return (
     <ScrollView
       style={{ flex: 1, backgroundColor: theme.colors.surface0 }}
-      contentContainerStyle={{ padding: layout.compact ? 16 : 24, gap: 16 }}
+      contentContainerStyle={{ padding: layout.compact ? 12 : 20 }}
     >
-      <View style={{ gap: 6 }}>
-        <Text style={[foreground, { fontSize: 22, fontWeight: "700" }]}>Action inbox</Text>
-        <Text style={muted}>
-          {snapshot.cards.length} item{snapshot.cards.length === 1 ? "" : "s"} across {hosts.length}{" "}
-          host
-          {hosts.length === 1 ? "" : "s"}
-        </Text>
-        {offlineHosts.length ? (
+      <View style={{ width: "100%", maxWidth: 880, alignSelf: "center", gap: 12 }}>
+        <View
+          style={{
+            flexDirection: "row",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <View style={{ gap: 3, flex: 1 }}>
+            <Text style={{ color: theme.colors.foreground, fontSize: 17, fontWeight: "500" }}>
+              {inbox.loading ? "Action inbox" : `${inbox.cards.length} need attention`}
+            </Text>
+            <Text style={muted}>
+              {readReady
+                ? `${unreadCount} unread`
+                : preferences.status === "loading"
+                  ? "Loading read status..."
+                  : "Read status unavailable"}{" "}
+              · {onlineCount} online {onlineCount === 1 ? "host" : "hosts"}
+            </Text>
+          </View>
+          <InboxButton
+            theme={theme}
+            compact={layout.compact}
+            onPress={() => void inbox.refresh()}
+            disabled={inbox.refreshing}
+            label="Refresh inbox"
+            icon="RefreshCw"
+            variant="outline"
+          />
+        </View>
+        <View style={{ gap: 6 }}>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+            <InboxFilter
+              title="Hosts"
+              allLabel="All hosts"
+              value={hostId}
+              options={inbox.hosts.map((host) => ({
+                value: host.serverId,
+                label: host.label,
+                description: host.status === "online" ? "Online" : "Offline or connecting",
+              }))}
+              onChange={(value) => {
+                setHostId(value);
+                setProjectKey(null);
+              }}
+              theme={theme}
+              compact={layout.compact}
+            />
+            <InboxFilter
+              title="Projects"
+              allLabel="All projects"
+              value={projectKey}
+              options={projects}
+              onChange={setProjectKey}
+              theme={theme}
+              compact={layout.compact}
+            />
+          </View>
+          <View
+            style={{
+              flexDirection: "row",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: 4,
+            }}
+          >
+            <View style={{ flexDirection: "row", gap: 2 }}>
+              <InboxButton
+                theme={theme}
+                compact={layout.compact}
+                selected={!unreadOnly}
+                onPress={() => setUnreadOnly(false)}
+              >
+                All
+              </InboxButton>
+              <InboxButton
+                theme={theme}
+                compact={layout.compact}
+                selected={unreadOnly}
+                disabled={!readReady}
+                onPress={() => setUnreadOnly(true)}
+              >
+                Unread{readReady ? ` ${scopedUnreadCount}` : ""}
+              </InboxButton>
+            </View>
+            <InboxButton
+              theme={theme}
+              compact={layout.compact}
+              disabled={
+                !readReady || preferences.saving || !visible.some((card) => isUnread(card, read))
+              }
+              onPress={() => void setRead(visible, true)}
+              label="Mark visible items read"
+              icon="CheckCheck"
+              variant="outline"
+            >
+              Mark all read
+            </InboxButton>
+          </View>
+        </View>
+        {offline.length ? (
           <Text style={muted}>
-            Offline or connecting: {offlineHosts.map((host) => host.label).join(", ")}
+            Offline or connecting: {offline.map((host) => host.label).join(", ")}. Showing online
+            hosts only.
           </Text>
         ) : null}
-        {snapshot.truncatedHosts.length ? (
-          <Text style={muted}>
-            Showing the first 1,000 agents on: {snapshot.truncatedHosts.join(", ")}
-          </Text>
+        {inbox.truncatedHosts.length ? (
+          <Text style={muted}>First 1,000 agents on: {inbox.truncatedHosts.join(", ")}</Text>
         ) : null}
-        {snapshot.errors.map((error) => (
-          <Text key={error} style={{ color: theme.colors.statusDanger }}>
+        {inbox.errors.map((error) => (
+          <Text key={error} style={{ color: theme.colors.statusDanger, fontSize: 12 }}>
             {error}
           </Text>
         ))}
-        {actionError ? (
-          <Text style={{ color: theme.colors.statusDanger }}>{actionError}</Text>
-        ) : null}
-        <Pressable
-          accessibilityRole="button"
-          onPress={() => void refresh()}
-          style={{ alignSelf: "flex-start", paddingVertical: 8 }}
-        >
-          <Text style={{ color: theme.colors.accent }}>Refresh</Text>
-        </Pressable>
-      </View>
-      {loading ? <Text style={muted}>Loading agents…</Text> : null}
-      {!loading && snapshot.cards.length === 0 ? (
-        <Text style={muted}>
-          No agent requests or completed work need attention on online hosts.
-        </Text>
-      ) : null}
-      {snapshot.cards.map((card) => {
-        const permission = card.permission;
-        const detail = permission ? permissionDetails(permission) : null;
-        const actions = permission ? directActions(permission) : [];
-        const title =
-          card.kind === "question"
-            ? permission?.title || "Agent question"
-            : card.kind === "approval"
-              ? permission?.title || "Approval requested"
-              : card.kind === "attention"
-                ? "Needs input"
-                : card.kind === "failed"
-                  ? "Failed run"
-                  : "Ready to review";
-        return (
-          <View
-            key={card.key}
-            style={{
-              padding: 16,
-              borderRadius: 12,
-              borderWidth: 1,
-              borderColor: theme.colors.foregroundMuted,
-              gap: 8,
-            }}
-          >
-            <Text style={[foreground, { fontSize: 17, fontWeight: "600" }]}>{title}</Text>
-            <Text style={muted}>
-              {card.hostLabel} · {card.projectName} · {card.agentTitle}
+        {preferences.status === "error" ||
+        preferences.status === "invalid" ||
+        preferences.saveError ? (
+          <View style={{ gap: 4 }}>
+            <Text style={{ color: theme.colors.statusDanger, fontSize: 12 }}>
+              {preferences.saveError ? "Could not save read status" : "Could not load read status"}
             </Text>
-            {card.error && card.kind === "failed" ? (
-              <Text style={foreground}>
-                {card.error.length <= 2000 ? card.error : `${card.error.slice(0, 2000)}…`}
-              </Text>
-            ) : null}
-            {permission?.description ? (
-              <Text style={foreground}>{permission.description}</Text>
-            ) : null}
-            {detail ? (
-              <Text selectable style={muted}>
-                {detail.length <= 4000 ? detail : `${detail.slice(0, 4000)}…`}
-              </Text>
-            ) : null}
-            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-              {actions.map((action) => (
-                <Pressable
-                  key={action.id}
-                  accessibilityRole="button"
-                  disabled={pendingKey !== null}
-                  onPress={() => void respond(card, action)}
-                  style={{
-                    backgroundColor:
-                      action.behavior === "deny" ? theme.colors.statusDanger : theme.colors.accent,
-                    paddingHorizontal: 12,
-                    paddingVertical: 8,
-                    borderRadius: 8,
-                  }}
-                >
-                  <Text style={buttonText}>
-                    {pendingKey === card.key ? "Sending…" : action.label}
-                  </Text>
-                </Pressable>
-              ))}
-              {navigation?.openAgent ? (
-                <Pressable
-                  accessibilityRole="button"
-                  onPress={() =>
-                    navigation.openAgent({ agentId: card.agentId, serverId: card.hostId })
-                  }
-                  style={{ paddingHorizontal: 12, paddingVertical: 8 }}
-                >
-                  <Text style={{ color: theme.colors.accent }}>Open agent</Text>
-                </Pressable>
-              ) : null}
-            </View>
+            <InboxButton
+              theme={theme}
+              compact={layout.compact}
+              onPress={() => void preferences.reload()}
+            >
+              Retry read status
+            </InboxButton>
           </View>
-        );
-      })}
+        ) : null}
+        {filtered ? (
+          <Text style={muted}>
+            {visible.length} shown
+            {hostId
+              ? ` · ${inbox.hosts.find((host) => host.serverId === hostId)?.label ?? "Selected host"}`
+              : ""}
+          </Text>
+        ) : null}
+        {inbox.loading ? <Text style={muted}>Loading agents...</Text> : null}
+        {!inbox.loading && visible.length === 0 ? (
+          <View style={{ paddingVertical: 32, gap: 8, alignItems: "center" }}>
+            <Text style={muted}>
+              {unreadOnly
+                ? "No unread items in this view"
+                : filtered
+                  ? "No items in this view"
+                  : "No requests need attention"}
+            </Text>
+            {filtered ? (
+              <InboxButton
+                theme={theme}
+                compact={layout.compact}
+                onPress={() => {
+                  setHostId(null);
+                  setProjectKey(null);
+                  setUnreadOnly(false);
+                }}
+              >
+                Clear filters
+              </InboxButton>
+            ) : null}
+          </View>
+        ) : null}
+        <View>
+          {visible.map((card) => (
+            <InboxRow
+              key={card.key}
+              card={card}
+              theme={theme}
+              compact={layout.compact}
+              unread={readReady ? isUnread(card, read) : null}
+              readDisabled={!readReady || preferences.saving}
+              onToggleRead={() => void setRead([card], isUnread(card, read))}
+              onOpen={
+                navigation?.openAgent
+                  ? () => {
+                      void setRead([card], true);
+                      navigation.openAgent({ agentId: card.agentId, serverId: card.hostId });
+                    }
+                  : undefined
+              }
+              getAgent={() => getPaseoClient(card.hostId).agents.ref(card.agentId)}
+              onRefresh={inbox.refresh}
+            />
+          ))}
+        </View>
+      </View>
     </ScrollView>
   );
 }

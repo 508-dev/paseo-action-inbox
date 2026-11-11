@@ -10,6 +10,7 @@ export interface InboxCard {
   agentId: string;
   workspaceId: string | null;
   projectName: string;
+  projectKey: string;
   agentTitle: string;
   kind: InboxKind;
   updatedAt: string;
@@ -26,7 +27,7 @@ export interface PermissionAction {
 
 export function cardsForAgent(
   agent: PaseoAgent,
-  location: { hostId: string; hostLabel: string; projectName: string },
+  location: { hostId: string; hostLabel: string; projectName: string; projectKey: string },
 ): InboxCard[] {
   if (agent.archivedAt || agent.background) return [];
   const base = {
@@ -35,6 +36,7 @@ export function cardsForAgent(
     agentId: agent.id,
     workspaceId: agent.workspaceId ?? null,
     projectName: location.projectName,
+    projectKey: JSON.stringify([location.hostId, location.projectKey]),
     agentTitle: agent.title || agent.provider,
     updatedAt: agent.attentionTimestamp ?? agent.updatedAt,
     error: agent.lastError ?? null,
@@ -70,8 +72,116 @@ export function cardsForAgent(
   return [];
 }
 
+export type ReadTokens = Record<string, string>;
+
+/** Permission revisions ignore unrelated agent updates; repeated completions use attention time. */
+export function readToken(card: InboxCard): string {
+  const value = JSON.stringify(card.permission ?? [card.updatedAt, card.kind, card.error]);
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = BigInt.asUintN(64, (hash ^ BigInt(value.charCodeAt(i))) * 0x100000001b3n);
+  }
+  return hash.toString(16);
+}
+
+export function isUnread(card: InboxCard, read: ReadTokens): boolean {
+  return read[card.key] !== readToken(card);
+}
+
+export function markRead(read: ReadTokens, cards: InboxCard[]): ReadTokens {
+  const next = { ...read };
+  for (const card of cards) {
+    delete next[card.key];
+    next[card.key] = readToken(card);
+  }
+  // Bound device storage while retaining recently read items, including disconnected hosts.
+  return Object.fromEntries(Object.entries(next).slice(-5000));
+}
+
+export interface InboxFilters {
+  hostId: string | null;
+  projectKey: string | null;
+  unreadOnly: boolean;
+}
+
+export function filterCards(
+  cards: InboxCard[],
+  filters: InboxFilters,
+  read: ReadTokens,
+): InboxCard[] {
+  return cards.filter(
+    (card) =>
+      (!filters.hostId || card.hostId === filters.hostId) &&
+      (!filters.projectKey || card.projectKey === filters.projectKey) &&
+      (!filters.unreadOnly || isUnread(card, read)),
+  );
+}
+
+export interface QuestionPreview {
+  question: string;
+  options: { label: string; description?: string }[];
+  multiSelect: boolean;
+}
+
+/** Read the provider's structured question payload without exposing transport metadata. */
+export function questionPreview(permission: Permission): QuestionPreview[] {
+  const input: unknown = permission.input;
+  if (
+    !input ||
+    typeof input !== "object" ||
+    !("questions" in input) ||
+    !Array.isArray(input.questions)
+  )
+    return [];
+  const result: QuestionPreview[] = [];
+  for (const value of input.questions) {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("question" in value) ||
+      typeof value.question !== "string"
+    )
+      continue;
+    const options: QuestionPreview["options"] = [];
+    if ("options" in value && Array.isArray(value.options)) {
+      for (const option of value.options) {
+        if (
+          !option ||
+          typeof option !== "object" ||
+          !("label" in option) ||
+          typeof option.label !== "string"
+        )
+          continue;
+        options.push({
+          label: option.label,
+          description:
+            "description" in option && typeof option.description === "string"
+              ? option.description
+              : undefined,
+        });
+      }
+    }
+    result.push({
+      question: value.question,
+      options,
+      multiSelect: "multiSelect" in value && value.multiSelect === true,
+    });
+  }
+  return result;
+}
+
+export function permissionSummary(permission: Permission): string {
+  if (permission.detail?.type === "shell") return permission.detail.command;
+  if (permission.description) return permission.description;
+  if (typeof permission.input?.command === "string") return permission.input.command;
+  return permission.title || "Open the agent to review this request";
+}
+
 export function permissionDetails(permission: Permission): string {
   const fields = {
+    kind: permission.kind,
+    title: permission.title,
+    provider: permission.provider,
     name: permission.name,
     description: permission.description,
     input: permission.input,
@@ -113,6 +223,9 @@ export async function respondToCard(
     (entry) => entry.id === card.permission?.id,
   );
   if (!request) throw new Error("This request is no longer pending");
+  if (permissionDetails(request) !== permissionDetails(card.permission)) {
+    throw new Error("This request changed. Refresh the inbox and review it again.");
+  }
   const allowed = directActions(request).find(
     (candidate) => candidate.id === action.id && candidate.behavior === action.behavior,
   );

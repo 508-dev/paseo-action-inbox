@@ -3,13 +3,23 @@ import { describe, expect, it, vi } from "vitest";
 import {
   cardsForAgent,
   directActions,
+  filterCards,
+  isUnread,
+  markRead,
+  questionPreview,
   respondToCard,
   sortCards,
   type InboxCard,
   type Permission,
 } from "./inbox-model";
+import { createInboxStore } from "./inbox-store";
 
-const location = { hostId: "host-a", hostLabel: "Laptop", projectName: "Paseo" };
+const location = {
+  hostId: "host-a",
+  hostLabel: "Laptop",
+  projectName: "Paseo",
+  projectKey: "paseo",
+};
 
 function agent(overrides: Partial<PaseoAgent> = {}): PaseoAgent {
   return {
@@ -88,6 +98,28 @@ describe("cross-host inbox classification", () => {
 });
 
 describe("direct permission actions", () => {
+  it("rejects a request whose content changed after the user reviewed it", async () => {
+    const original = permission();
+    const card = cardsForAgent(agent({ pendingPermissions: [original] }), location)[0];
+    const respondToPermission = vi.fn();
+    await expect(
+      respondToCard(
+        card,
+        directActions(original)[1],
+        () =>
+          ({
+            refresh: async () => ({
+              agent: agent({
+                pendingPermissions: [permission({ input: { command: "different command" } })],
+              }),
+              project: null,
+            }),
+            respondToPermission,
+          }) as Pick<PaseoAgentHandle, "refresh" | "respondToPermission">,
+      ),
+    ).rejects.toThrow("request changed");
+    expect(respondToPermission).not.toHaveBeenCalled();
+  });
   it("offers the same default tool decisions as Paseo's agent view", () => {
     expect(directActions(permission()).map(({ id, behavior }) => ({ id, behavior }))).toEqual([
       { id: "reject", behavior: "deny" },
@@ -144,5 +176,145 @@ describe("direct permission actions", () => {
       requestId: "request-a",
       response: { behavior: "allow", selectedActionId: "once" },
     });
+  });
+});
+
+describe("inbox read state and filters", () => {
+  it("keeps an approval read across refreshes and saved-state reloads, but marks changed content unread", () => {
+    const original = cardsForAgent(agent({ pendingPermissions: [permission()] }), location)[0];
+    expect(isUnread(original, {})).toBe(true);
+    const saved = JSON.parse(JSON.stringify(markRead({}, [original])));
+    const refreshed = { ...original, updatedAt: "2026-11-10T13:00:00Z" };
+    expect(isUnread(refreshed, saved)).toBe(false);
+    const changed = {
+      ...refreshed,
+      permission: permission({ input: { command: "npm run build" } }),
+    };
+    expect(isUnread(changed, saved)).toBe(true);
+    expect(JSON.stringify(saved)).not.toContain("npm test");
+  });
+
+  it("treats a later completion as unread without removing a read item from the inbox", () => {
+    const card = cardsForAgent(
+      agent({
+        requiresAttention: true,
+        attentionReason: "finished",
+        attentionTimestamp: "2026-11-10T12:00:00Z",
+      }),
+      location,
+    )[0];
+    const saved = markRead({}, [card]);
+    expect(
+      filterCards([card], { hostId: null, projectKey: null, unreadOnly: false }, saved),
+    ).toHaveLength(1);
+    expect(
+      filterCards([card], { hostId: null, projectKey: null, unreadOnly: true }, saved),
+    ).toEqual([]);
+    expect(isUnread({ ...card, updatedAt: "2026-11-10T13:00:00Z" }, saved)).toBe(true);
+  });
+
+  it("combines host, project and unread filters without merging identically named projects", () => {
+    const a = cardsForAgent(agent({ status: "error" }), location)[0];
+    const b = cardsForAgent(agent({ status: "error" }), { ...location, hostId: "host-b" })[0];
+    expect(a.projectKey).not.toBe(b.projectKey);
+    const filters = { hostId: "host-a", projectKey: a.projectKey, unreadOnly: true };
+    const visible = filterCards([a, b], filters, {});
+    expect(visible).toEqual([a]);
+    const saved = markRead({}, visible);
+    expect(isUnread(a, saved)).toBe(false);
+    expect(isUnread(b, saved)).toBe(true);
+  });
+
+  it("reads question text and choices without leaking metadata into the preview", () => {
+    expect(
+      questionPreview(
+        permission({
+          kind: "question",
+          metadata: { internal: "hidden" },
+          input: {
+            questions: [
+              {
+                question: "Which layout?",
+                header: "Layout",
+                options: [{ label: "Compact", description: "More rows" }, { label: "Roomy" }],
+                multiSelect: false,
+              },
+            ],
+          },
+        }),
+      ),
+    ).toEqual([
+      {
+        question: "Which layout?",
+        options: [
+          { label: "Compact", description: "More rows" },
+          { label: "Roomy", description: undefined },
+        ],
+        multiSelect: false,
+      },
+    ]);
+    expect(
+      questionPreview(
+        permission({ kind: "question", input: { questions: [null, { unexpected: true }] } }),
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("shared inbox observation", () => {
+  const hosts = [{ serverId: "host-a", label: "Laptop", status: "online" as const }];
+
+  it("shares one polling loop between sidebar and screen and stops when both unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const load = vi.fn(async () => ({ cards: [], truncated: false }));
+      const store = createInboxStore(load);
+      const sidebar = store.retain(hosts);
+      const screen = store.retain(hosts);
+      await store.refresh();
+      expect(load).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(load).toHaveBeenCalledTimes(2);
+      sidebar();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(load).toHaveBeenCalledTimes(3);
+      screen();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(load).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("discards a pending host response after that host disconnects", async () => {
+    let resolve!: (result: { cards: InboxCard[]; truncated: boolean }) => void;
+    const load = vi.fn(
+      () =>
+        new Promise<{ cards: InboxCard[]; truncated: boolean }>((done) => {
+          resolve = done;
+        }),
+    );
+    const store = createInboxStore(load);
+    const first = store.retain(hosts);
+    const second = store.retain([{ ...hosts[0], status: "offline" }]);
+    await store.refresh();
+    resolve({ cards: cardsForAgent(agent({ status: "error" }), location), truncated: false });
+    await Promise.resolve();
+    expect(store.getSnapshot().cards).toEqual([]);
+    first();
+    second();
+  });
+
+  it("a forced refresh after an action supersedes an older pending read", async () => {
+    const resolvers: ((result: { cards: InboxCard[]; truncated: boolean }) => void)[] = [];
+    const store = createInboxStore(() => new Promise((resolve) => resolvers.push(resolve)));
+    const release = store.retain(hosts);
+    const newest = store.refresh(true);
+    resolvers[1]({ cards: [], truncated: false });
+    await newest;
+    resolvers[0]({ cards: cardsForAgent(agent({ status: "error" }), location), truncated: false });
+    await Promise.resolve();
+    expect(store.getSnapshot().cards).toEqual([]);
+    release();
   });
 });
