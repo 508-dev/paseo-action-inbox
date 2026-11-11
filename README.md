@@ -12,8 +12,10 @@ The sidebar shows the unread count across online hosts. Reading an item keeps it
 Install from source on a daemon host:
 
 ```sh
-paseo plugin install git:508-dev/paseo-action-inbox
+paseo plugin install git:508-dev/paseo-action-inbox --ref feat/cross-host-inbox
 ```
+
+After PR #1 merges, omit `--ref` to use the default branch. The daemon needs Node and npm on its command path. The manifest installs the locked SDK and validation dependencies, including development dependencies required by the current type-import validator, with lifecycle scripts disabled.
 
 Enable plugins in Paseo's plugin settings if that daemon has them disabled. Plugin code is trusted and runs inside the Paseo app. Review the source before installing it.
 
@@ -31,7 +33,7 @@ Enable plugins in Paseo's plugin settings if that daemon has them disabled. Plug
 ## Development
 
 ```sh
-npm ci --legacy-peer-deps --ignore-scripts
+npm ci --include=dev --legacy-peer-deps --ignore-scripts
 npm run typecheck
 npm run lint
 npm run format:check
