@@ -1,5 +1,7 @@
 # Paseo action inbox
 
+Development continues in [508-dev/paseo-plugins](https://github.com/508-dev/paseo-plugins/tree/main/plugins/action-inbox). This repository remains installable for existing sources. Read the [migration guide](https://github.com/508-dev/paseo-plugins/blob/main/docs/migration.md) before switching an existing installation.
+
 See agent requests and completed work across your connected Paseo hosts in one screen. Scan questions, approvals, failed runs, and finished work in a compact list. Filter by host, project, or unread status, and open the owning agent to act.
 
 The sidebar shows the unread count across online hosts. Reading an item keeps it in the inbox until its underlying request or attention state is resolved.
